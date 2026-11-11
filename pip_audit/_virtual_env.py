@@ -69,6 +69,7 @@ class VirtualEnv(venv.EnvBuilder):
         self._index_url = index_url
         self._extra_index_urls = extra_index_urls
         self._packages: list[tuple[str, Version]] | None = None
+        self._env_exe: str | None = None
         self._state = state
 
     def create(self, env_dir: str | bytes | PathLike[str] | PathLike[bytes]) -> None:
@@ -135,6 +136,31 @@ class VirtualEnv(venv.EnvBuilder):
         except CalledProcessError as cpe:
             raise VirtualEnvError(f"Failed to upgrade `pip`: {pip_upgrade_cmd}") from cpe
 
+        self._env_exe = context.env_exe
+        self._packages = self._resolve_packages(self._install_args)
+
+    def resolve(self, install_args: list[str]) -> list[tuple[str, Version]]:
+        """
+        Resolve an additional set of packages within the created environment,
+        returning the list of packages that would be installed for them.
+
+        This method can only be called after the `create` method has been called
+        and while the created environment still exists on disk.
+        """
+        if self._env_exe is None:
+            raise VirtualEnvError(
+                "Invalid usage of wrapper."
+                "The `create` method must be called before resolving additional packages."
+            )
+        return self._resolve_packages(install_args)
+
+    def _resolve_packages(self, install_args: list[str]) -> list[tuple[str, Version]]:
+        """
+        Perform a `pip install --dry-run` for the given install arguments within the
+        created environment and return the resolved list of packages.
+        """
+        assert self._env_exe is not None
+
         self._state.update_state("Installing package in isolated environment")
 
         with TemporaryDirectory() as ve_dir, NamedTemporaryFile(dir=ve_dir, delete=False) as tmp:
@@ -150,7 +176,7 @@ class VirtualEnv(venv.EnvBuilder):
             # is required beginning with pip 23.1, since `--no-input` disables the default
             # keyring behavior.
             package_install_cmd = [
-                context.env_exe,
+                self._env_exe,
                 "-m",
                 "pip",
                 "install",
@@ -160,7 +186,7 @@ class VirtualEnv(venv.EnvBuilder):
                 "--dry-run",
                 "--report",
                 tmp.name,
-                *self._install_args,
+                *install_args,
             ]
             try:
                 run(package_install_cmd, log_stdout=True, state=self._state)
@@ -175,12 +201,11 @@ class VirtualEnv(venv.EnvBuilder):
             package_list = install_report["install"]
 
             # Convert into a series of name, version pairs
-            self._packages = []
+            packages = []
             for package in package_list:
                 package_metadata = package["metadata"]
-                self._packages.append(
-                    (package_metadata["name"], Version(package_metadata["version"]))
-                )
+                packages.append((package_metadata["name"], Version(package_metadata["version"])))
+            return packages
 
     @property
     def installed_packages(self) -> Iterator[tuple[str, Version]]:

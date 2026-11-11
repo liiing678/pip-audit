@@ -10,6 +10,11 @@ All versions prior to 0.0.9 are untracked.
 
 ### Fixed
 
+* Fixed a bug where `pip-audit --fix` with multiple requirements files would
+  add a fixed subdependency to every file, instead of only the files that
+  actually contain the dependency
+  ([#855](https://github.com/pypa/pip-audit/issues/855))
+
 * Editable requirements skipped with `--skip-editable` no longer require a hash
   when auditing hashed requirements files
   ([#1024](https://github.com/pypa/pip-audit/issues/1024))

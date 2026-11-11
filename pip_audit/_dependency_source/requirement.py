@@ -141,6 +141,7 @@ class RequirementSource(DependencySource):
     def _collect_from_files(self, filenames: list[Path]) -> Iterator[Dependency]:
         # Figure out whether we have a fully resolved set of dependencies.
         reqs: list[InstallRequirement] = []
+        reqs_by_file: dict[Path, list[InstallRequirement]] = {}
         require_hashes: bool = self._require_hashes
         for filename in filenames:
             rf = RequirementsFile.from_file(filename)
@@ -154,6 +155,7 @@ class RequirementSource(DependencySource):
             # If one or more requirements have a hash, this implies `--require-hashes`.
             require_hashes = require_hashes or any(req.hash_options for req in rf.requirements)
             reqs.extend(rf.requirements)
+            reqs_by_file[filename] = rf.requirements
 
         # If the user has supplied `--no-deps` or there are hashed requirements, we should assume
         # that we have a fully resolved set of dependencies and we should waste time by invoking
@@ -163,6 +165,12 @@ class RequirementSource(DependencySource):
                 raise RequirementSourceError(
                     "the --disable-pip flag can only be used with a hashed requirements files or "
                     "if the --no-deps flag has been provided"
+                )
+            # Record which dependencies belong to each file so that fixes are only
+            # applied to the files that actually contain them.
+            for filename, file_reqs in reqs_by_file.items():
+                self._dep_cache[filename] = set(
+                    self._collect_preresolved_deps(iter(file_reqs), require_hashes)
                 )
             yield from self._collect_preresolved_deps(iter(reqs), require_hashes)
             return
@@ -178,11 +186,38 @@ class RequirementSource(DependencySource):
         try:
             with TemporaryDirectory() as ve_dir:
                 ve.create(ve_dir)
+
+                # Resolve each requirements file individually within the same
+                # environment to figure out which dependencies (including
+                # subdependencies) belong to each file. This allows fixes to be
+                # applied only to the files that actually contain the dependency.
+                if len(filenames) > 1:
+                    for filename in filenames:
+                        file_ve_args = []
+                        if self._require_hashes:
+                            file_ve_args.append("--require-hashes")
+                        file_ve_args.extend(["-r", str(filename)])
+                        try:
+                            self._dep_cache[filename] = {
+                                ResolvedDependency(name, version)
+                                for name, version in ve.resolve(file_ve_args)
+                            }
+                        except VirtualEnvError as exc:
+                            # If we can't resolve an individual file, leave it out of
+                            # the cache; fixes will fall back to being applied to it.
+                            logger.warning(
+                                f"failed to resolve dependencies for {filename} individually: {exc}"
+                            )
         except VirtualEnvError as exc:
             raise RequirementSourceError(str(exc)) from exc
 
         # Now query the installed packages.
-        for name, version in ve.installed_packages:
+        installed_packages = list(ve.installed_packages)
+        if len(filenames) == 1:
+            self._dep_cache[filenames[0]] = {
+                ResolvedDependency(name, version) for name, version in installed_packages
+            }
+        for name, version in installed_packages:
             yield ResolvedDependency(name=name, version=version)
 
     def fix(self, fix_version: ResolvedFixVersion) -> None:
@@ -202,10 +237,6 @@ class RequirementSource(DependencySource):
             try:
                 # Now fix the files inplace
                 for filename in self._filenames:
-                    self.state.update_state(
-                        f"Fixing dependency {fix_version.dep.name} ({fix_version.dep.version} => "
-                        f"{fix_version.version})"
-                    )
                     self._fix_file(filename, fix_version)
             except Exception as e:
                 logger.warning(
@@ -221,6 +252,35 @@ class RequirementSource(DependencySource):
         # This time we're using the `RequirementsFile.parse` API instead of `Requirements.from_file`
         # since we want to access each line sequentially in order to rewrite the file.
         reqs = list(RequirementsFile.parse(filename=filename.as_posix()))
+
+        # If we resolved dependencies during collection, we know which files this
+        # dependency belongs to. Skip any file that neither explicitly lists the
+        # dependency nor pulls it in as a subdependency, so that fixes only land
+        # in the files that actually contain the dependency.
+        file_deps = self._dep_cache.get(filename)
+        if file_deps is not None:
+            explicitly_listed = any(
+                isinstance(req, InstallRequirement)
+                and req.req is not None
+                and canonicalize_name(req.name) == fix_version.dep.canonical_name
+                for req in reqs
+            )
+            resolved_to_file = any(
+                isinstance(dep, ResolvedDependency)
+                and dep.canonical_name == fix_version.dep.canonical_name
+                for dep in file_deps
+            )
+            if not explicitly_listed and not resolved_to_file:
+                logger.debug(
+                    f"skipping requirements file {filename}: does not contain "
+                    f"dependency {fix_version.dep.canonical_name}"
+                )
+                return
+
+        self.state.update_state(
+            f"Fixing dependency {fix_version.dep.name} ({fix_version.dep.version} => "
+            f"{fix_version.version})"
+        )
 
         # Check ahead of time for anything invalid in the requirements file since we don't want to
         # encounter this while writing out the file. Check for duplicate requirements and lines that

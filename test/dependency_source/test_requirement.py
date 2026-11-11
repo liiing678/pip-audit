@@ -11,13 +11,14 @@ import pretend  # type: ignore
 import pytest
 from packaging.version import Version
 
+from pip_audit._audit import Auditor
 from pip_audit._dependency_source import (
     PYPI_URL,
     DependencyFixError,
     DependencySourceError,
     requirement,
 )
-from pip_audit._fix import ResolvedFixVersion
+from pip_audit._fix import ResolvedFixVersion, resolve_fix_versions
 from pip_audit._service import ResolvedDependency, SkippedDependency
 from pip_audit._state import AuditState
 from pip_audit._virtual_env import VirtualEnv, VirtualEnvError
@@ -401,6 +402,159 @@ def test_requirement_source_fix_rollback_failure(monkeypatch, req_file):
     for expected_req, req_path in zip(expected_reqs, req_paths, strict=True):
         with open(req_path) as f:
             assert expected_req == f.read().strip()
+
+
+def _mock_virtual_env(monkeypatch, combined, per_file):
+    class MockVirtualEnv:
+        def __init__(
+            self,
+            install_args: list[str],
+            index_url: str | None = None,
+            extra_index_urls: list[str] = [],
+            state: AuditState = AuditState(),
+        ) -> None:
+            pass
+
+        def create(self, dir: Path) -> None:
+            pass
+
+        @property
+        def installed_packages(self):
+            yield from combined
+
+        def resolve(self, install_args: list[str]):
+            return per_file[Path(install_args[-1])]
+
+    monkeypatch.setattr(requirement, "VirtualEnv", MockVirtualEnv)
+
+
+def test_requirement_source_fix_subdep_only_owning_file(monkeypatch, tmp_path, vuln_service):
+    # `foo` is a vulnerable subdependency that only `a.txt` pulls in (via `bar`).
+    # The fix must only land in `a.txt`; `b.txt` must remain untouched.
+    a_txt = tmp_path / "a.txt"
+    b_txt = tmp_path / "b.txt"
+    a_txt.write_text("bar==2.0\n")
+    b_txt.write_text("# a comment\nbaz==3.0\n")
+
+    _mock_virtual_env(
+        monkeypatch,
+        combined=[
+            ("bar", Version("2.0")),
+            ("foo", Version("1.0.0")),
+            ("baz", Version("3.0")),
+        ],
+        per_file={
+            a_txt: [("bar", Version("2.0")), ("foo", Version("1.0.0"))],
+            b_txt: [("baz", Version("3.0"))],
+        },
+    )
+
+    source = requirement.RequirementSource([a_txt, b_txt])
+    auditor = Auditor(vuln_service())
+    result = dict(auditor.audit(source))
+    fixes = list(resolve_fix_versions(vuln_service(), result))
+    assert len(fixes) == 1
+    for fix in fixes:
+        source.fix(fix)
+
+    assert a_txt.read_text() == (
+        "bar==2.0\n    # pip-audit: subdependency explicitly fixed\nfoo==1.1.0\n"
+    )
+    assert b_txt.read_text() == "# a comment\nbaz==3.0\n"
+
+
+def test_requirement_source_fix_subdep_shared_files(monkeypatch, tmp_path):
+    # Both files pull in the same vulnerable subdependency `foo`, so both files
+    # must receive the explicit pin.
+    a_txt = tmp_path / "a.txt"
+    b_txt = tmp_path / "b.txt"
+    a_txt.write_text("bar==2.0\n")
+    b_txt.write_text("qux==4.0\n")
+
+    _mock_virtual_env(
+        monkeypatch,
+        combined=[
+            ("bar", Version("2.0")),
+            ("qux", Version("4.0")),
+            ("foo", Version("1.0.0")),
+        ],
+        per_file={
+            a_txt: [("bar", Version("2.0")), ("foo", Version("1.0.0"))],
+            b_txt: [("qux", Version("4.0")), ("foo", Version("1.0.0"))],
+        },
+    )
+
+    source = requirement.RequirementSource([a_txt, b_txt])
+    list(source.collect())
+    source.fix(
+        ResolvedFixVersion(
+            dep=ResolvedDependency(name="foo", version=Version("1.0.0")),
+            version=Version("1.1.0"),
+        )
+    )
+
+    assert a_txt.read_text() == (
+        "bar==2.0\n    # pip-audit: subdependency explicitly fixed\nfoo==1.1.0\n"
+    )
+    assert b_txt.read_text() == (
+        "qux==4.0\n    # pip-audit: subdependency explicitly fixed\nfoo==1.1.0\n"
+    )
+
+
+def test_requirement_source_fix_subdep_rollback(monkeypatch, tmp_path):
+    # `foo` belongs to both files. `b.txt` fails to be fixed (duplicate `foo`
+    # requirements), so the entire fix must be rolled back, including the
+    # already-applied changes to `a.txt`.
+    a_txt = tmp_path / "a.txt"
+    b_txt = tmp_path / "b.txt"
+    a_txt.write_text("bar==2.0\n")
+    b_txt.write_text("foo==1.0.0\nfoo==1.0.1\n")
+
+    _mock_virtual_env(
+        monkeypatch,
+        combined=[
+            ("bar", Version("2.0")),
+            ("foo", Version("1.0.0")),
+        ],
+        per_file={
+            a_txt: [("bar", Version("2.0")), ("foo", Version("1.0.0"))],
+            b_txt: [("foo", Version("1.0.0"))],
+        },
+    )
+
+    source = requirement.RequirementSource([a_txt, b_txt])
+    list(source.collect())
+    with pytest.raises(DependencyFixError):
+        source.fix(
+            ResolvedFixVersion(
+                dep=ResolvedDependency(name="foo", version=Version("1.0.0")),
+                version=Version("1.1.0"),
+            )
+        )
+
+    assert a_txt.read_text() == "bar==2.0\n"
+    assert b_txt.read_text() == "foo==1.0.0\nfoo==1.0.1\n"
+
+
+def test_requirement_source_fix_disable_pip_attribution(tmp_path):
+    # With pre-resolved dependencies, each dependency belongs to the file that
+    # lists it. Fixing `foo` must not append it to `b.txt`.
+    a_txt = tmp_path / "a.txt"
+    b_txt = tmp_path / "b.txt"
+    a_txt.write_text("foo==1.0.0\n")
+    b_txt.write_text("baz==3.0\n")
+
+    source = requirement.RequirementSource([a_txt, b_txt], disable_pip=True, no_deps=True)
+    list(source.collect())
+    source.fix(
+        ResolvedFixVersion(
+            dep=ResolvedDependency(name="foo", version=Version("1.0.0")),
+            version=Version("1.1.0"),
+        )
+    )
+
+    assert a_txt.read_text() == "foo==1.1.0\n"
+    assert b_txt.read_text() == "baz==3.0\n"
 
 
 @pytest.mark.online
