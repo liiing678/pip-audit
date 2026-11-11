@@ -2,6 +2,7 @@ from pathlib import Path
 
 import pretend  # type: ignore
 import pytest
+from packaging.version import Version
 
 import pip_audit._cli
 from pip_audit._cli import (
@@ -11,6 +12,7 @@ from pip_audit._cli import (
     VulnerabilityDescriptionChoice,
     VulnerabilityServiceChoice,
 )
+from pip_audit._service.interface import ResolvedDependency, VulnerabilityResult
 
 
 class TestOutputFormatChoice:
@@ -135,6 +137,76 @@ def test_plurals(capsys, monkeypatch, args, vuln_count, pkg_count, expected):
     except SystemExit:
         pass
 
+    captured = capsys.readouterr()
+    assert expected in captured.err
+
+
+@pytest.mark.parametrize(
+    "ignore_args, exit_code, expected",
+    [
+        # A package-qualified ignore only suppresses the vulnerability for the
+        # named package; the same vulnerability on another package still fails.
+        (
+            ["--ignore-vuln", "foo:CVE-1234"],
+            1,
+            "Found 1 known vulnerability, ignored 1 in 1 package",
+        ),
+        # Package names are normalized before matching.
+        (
+            ["--ignore-vuln", "FOO:CVE-1234"],
+            1,
+            "Found 1 known vulnerability, ignored 1 in 1 package",
+        ),
+        # Qualifying every affected package suppresses the vulnerability entirely.
+        (
+            ["--ignore-vuln", "foo:CVE-1234", "--ignore-vuln", "bar:PYSEC-0000"],
+            0,
+            "No known vulnerabilities found, 2 ignored",
+        ),
+        # A package-qualified ignore for a different package suppresses nothing.
+        (
+            ["--ignore-vuln", "baz:CVE-1234"],
+            1,
+            "Found 2 known vulnerabilities in 2 packages",
+        ),
+        # The unqualified form still ignores the vulnerability globally.
+        (
+            ["--ignore-vuln", "CVE-1234"],
+            0,
+            "No known vulnerabilities found, 2 ignored",
+        ),
+    ],
+)
+def test_ignore_vuln_pkg_qualified(capsys, monkeypatch, ignore_args, exit_code, expected):
+    dummysource = pretend.stub(fix=lambda a: None)
+    monkeypatch.setattr(pip_audit._cli, "PipSource", lambda *a, **kw: dummysource)
+
+    parser = pip_audit._cli._parser()
+    monkeypatch.setattr(pip_audit._cli, "_parse_args", lambda *a: parser.parse_args(ignore_args))
+
+    def vuln():
+        return VulnerabilityResult(
+            id="PYSEC-0000",
+            description="stub",
+            fix_versions=[Version("2.0")],
+            aliases={"CVE-1234"},
+        )
+
+    result = [
+        (ResolvedDependency(name="foo", version=Version("1.0")), [vuln()]),
+        (ResolvedDependency(name="bar", version=Version("1.0")), [vuln()]),
+    ]
+
+    auditor = pretend.stub(audit=lambda a: result)
+    monkeypatch.setattr(pip_audit._cli, "Auditor", lambda *a, **kw: auditor)
+
+    actual_exit_code = 0
+    try:
+        pip_audit._cli.audit()
+    except SystemExit as e:
+        actual_exit_code = e.code
+
+    assert actual_exit_code == exit_code
     captured = capsys.readouterr()
     assert expected in captured.err
 

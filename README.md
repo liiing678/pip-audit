@@ -221,8 +221,9 @@ options:
   -o FILE, --output FILE
                         output results to the given file (default: stdout)
   --ignore-vuln ID      ignore a specific vulnerability by its vulnerability
-                        ID; this option can be used multiple times (default:
-                        [])
+                        ID; use PKG:ID to ignore a vulnerability only for the
+                        named package; this option can be used multiple times
+                        (default: [])
   --disable-pip         don't use `pip` for dependency resolution; this can
                         only be used with hashed requirements files or if the
                         `--no-deps` flag has been provided (default: False)
@@ -452,6 +453,16 @@ It can also be passed multiple times, to ignore multiple reports:
 ```console
 # Run the audit as normal, but exclude any reports that match these IDs
 $ pip-audit --ignore-vuln CVE-XXX-YYYY --ignore-vuln CVE-ZZZ-AAAA
+```
+
+To ignore a vulnerability report only for a specific dependency (while still
+failing on the same vulnerability in any other dependency), use the
+`PKG:ID` form. The package name is normalized, so `Foo_Bar:CVE-XXX-YYYY`
+matches the `foo-bar` package:
+
+```console
+# Ignore GHSA-w596-4wvx-j9j6 only for pytest, but not for any other package
+$ pip-audit --ignore-vuln pytest:GHSA-w596-4wvx-j9j6
 ```
 
 ### `pip-audit` takes longer than I expect!

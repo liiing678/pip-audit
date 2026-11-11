@@ -14,6 +14,8 @@ from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import IO, NoReturn, cast
 
+from packaging.utils import canonicalize_name
+
 from pip_audit import __version__
 from pip_audit._audit import AuditOptions, Auditor
 from pip_audit._dependency_source import (
@@ -381,6 +383,7 @@ def _parser() -> argparse.ArgumentParser:  # pragma: no cover
         default=[],
         help=(
             "ignore a specific vulnerability by its vulnerability ID; "
+            "use PKG:ID to ignore a vulnerability only for the named package; "
             "this option can be used multiple times"
         ),
     )
@@ -549,7 +552,14 @@ def audit() -> None:  # pragma: no cover
         vuln_count = 0
         skip_count = 0
         vuln_ignore_count = 0
-        vulns_to_ignore = set(args.ignore_vulns)
+        vulns_to_ignore: set[str] = set()
+        pkg_vulns_to_ignore: dict[str, set[str]] = {}
+        for ignore in args.ignore_vulns:
+            pkg, sep, vuln_id = ignore.partition(":")
+            if sep:
+                pkg_vulns_to_ignore.setdefault(canonicalize_name(pkg), set()).add(vuln_id)
+            else:
+                vulns_to_ignore.add(ignore)
         try:
             for spec, vulns in auditor.audit(source):
                 if spec.is_skipped():
@@ -563,8 +573,11 @@ def audit() -> None:  # pragma: no cover
                     spec = cast(ResolvedDependency, spec)
                     logger.debug(f"Auditing {spec.name} ({spec.version})")
                     state.update_state(f"Auditing {spec.name} ({spec.version})")
-                if vulns_to_ignore:
-                    filtered_vulns = [v for v in vulns if not v.has_any_id(vulns_to_ignore)]
+                if vulns_to_ignore or pkg_vulns_to_ignore:
+                    ids_to_ignore = vulns_to_ignore | pkg_vulns_to_ignore.get(
+                        spec.canonical_name, set()
+                    )
+                    filtered_vulns = [v for v in vulns if not v.has_any_id(ids_to_ignore)]
                     vuln_ignore_count += len(vulns) - len(filtered_vulns)
                     vulns = filtered_vulns
                 result[spec] = vulns
